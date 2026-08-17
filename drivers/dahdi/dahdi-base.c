@@ -151,6 +151,62 @@ int debug;
 
 static int hwec_overrides_swec = 1;
 
+/*
+ * ANSI T1.601 / ADTRAN BRITE support.
+ *
+ * A BRITE D+ transport exposes the B1 and B2 octets on three ordinary
+ * DAHDI channels, but carries the U-interface M channel in bit 5 of the D
+ * channel.  The M-channel CRC covers all three transmit channels, so it
+ * must be made here, after DAHDI has filled every writechunk.  Leaving this
+ * disabled is a no-op; brite_dchan identifies the D+ channel when enabled.
+ */
+static int brite_dchan;
+
+#define BRITE_D6_MASK	0x04	/* Telco bit 6 (first D bit). */
+#define BRITE_D7_MASK	0x02	/* Telco bit 7 (second D bit). */
+#define BRITE_M_MASK	0x08	/* Telco bit 5 (host bit 3). */
+#define BRITE_HISTORY	256
+
+struct brite_state {
+	unsigned char overhead[BRITE_HISTORY];
+	unsigned int overhead_head;
+	unsigned int overhead_count;
+	unsigned long sample;
+	unsigned long marker_sample;
+	unsigned int synced:1;
+	unsigned int collecting:1;
+	u16 crc;
+	u16 tx_crc;
+};
+
+struct brite_rx_state {
+	unsigned char overhead[BRITE_HISTORY];
+	unsigned int overhead_head;
+	unsigned int overhead_count;
+	unsigned long sample;
+	unsigned long marker_sample;
+	unsigned int synced:1;
+	unsigned int collecting:1;
+	unsigned int have_expected:1;
+	u16 crc[4];
+	u16 expected[4];
+	u16 received_crc;
+	unsigned int m4;
+};
+
+static struct brite_state brite_state;
+static struct brite_rx_state brite_rx_state;
+static DEFINE_SPINLOCK(brite_lock);
+
+/* Read-only diagnostics for selecting the exact DS0 serialization order. */
+static unsigned long brite_tx_superframes;
+static unsigned long brite_tx_sync_losses;
+static unsigned long brite_rx_crc_checks;
+static unsigned long brite_rx_crc_msb_dnormal;
+static unsigned long brite_rx_crc_lsb_dnormal;
+static unsigned long brite_rx_crc_msb_dreverse;
+static unsigned long brite_rx_crc_lsb_dreverse;
+
 /*!
  * \brief states for transmit signalling
  */
@@ -9801,6 +9857,337 @@ static void __transmit_to_slaves(struct dahdi_chan *const chan)
 	}
 }
 
+/* ANSI T1.601 figure 25, with register cell 12 as the MSB. */
+static inline u16 brite_crc12_update(u16 crc, unsigned int bit)
+{
+	unsigned int feedback = bit ^ (crc >> 11);
+
+	crc = (crc << 1) & 0x0fff;
+	if (feedback)
+		crc ^= 0x080f;
+	return crc;
+}
+
+static inline void brite_crc12_bit(struct brite_state *state, unsigned int bit)
+{
+	state->crc = brite_crc12_update(state->crc, bit);
+}
+
+static inline u16 brite_crc12_octet(u16 crc, u8 octet, bool lsb_first)
+{
+	int bit;
+
+	if (lsb_first) {
+		for (bit = 0; bit < 8; ++bit)
+			crc = brite_crc12_update(crc, (octet >> bit) & 1);
+	} else {
+		for (bit = 7; bit >= 0; --bit)
+			crc = brite_crc12_update(crc, (octet >> bit) & 1);
+	}
+	return crc;
+}
+
+static inline unsigned int brite_m4_bit(unsigned int basic_frame)
+{
+	/* Network-to-NT: act=1, dea=0, then 1, 1, 1, 1, uoa=1, aib=1. */
+	return basic_frame != 1;
+}
+
+static unsigned int brite_m_bit(const struct brite_state *state,
+	unsigned int basic_frame, unsigned int m_bit)
+{
+	unsigned int crc_bit;
+
+	/* The dormant EOC and the three reserved M5/M6 bits are binary one. */
+	if (m_bit < 3 || m_bit == 3 || basic_frame < 2)
+		return m_bit == 3 ? brite_m4_bit(basic_frame) : 1;
+
+	/* CRC1 is the most-significant bit of the previous superframe's CRC. */
+	crc_bit = 2 * (basic_frame - 2) + (m_bit - 4);
+	return (state->tx_crc >> (11 - crc_bit)) & 1;
+}
+
+static void brite_record_overhead(struct brite_state *state, unsigned int bit)
+{
+	state->overhead[state->overhead_head++ & (BRITE_HISTORY - 1)] = bit;
+	if (state->overhead_count < BRITE_HISTORY)
+		++state->overhead_count;
+}
+
+/*
+ * The BRITE carrier and the M channel are interleaved in bit 5.  One
+ * carrier marker and 47 zeroes occur on one parity of a 96-DS0 cycle.
+ */
+static void brite_find_sync(struct brite_state *state)
+{
+	unsigned int lane;
+
+	if (state->overhead_count < 96)
+		return;
+	for (lane = 0; lane != 2; ++lane) {
+		unsigned int marker = 0;
+		unsigned int markers = 0;
+		unsigned int pos;
+
+		for (pos = lane; pos < 96; pos += 2) {
+			unsigned int index = (state->overhead_head - 96 + pos)
+				& (BRITE_HISTORY - 1);
+
+			if (state->overhead[index]) {
+				++markers;
+				marker = pos;
+			}
+		}
+		if (markers == 1) {
+			state->marker_sample = state->sample - 95 + marker;
+			state->synced = 1;
+			state->collecting = 0;
+			state->crc = 0;
+			state->tx_crc = 0;
+			return;
+		}
+	}
+}
+
+static bool brite_channels(struct dahdi_span *span, struct dahdi_chan **b1,
+	struct dahdi_chan **b2, struct dahdi_chan **d)
+{
+	unsigned int x;
+
+	if (brite_dchan < 3)
+		return false;
+	for (x = 2; x < span->channels; ++x) {
+		struct dahdi_chan *candidate = span->chans[x];
+
+		if (candidate->channo != brite_dchan)
+			continue;
+		if (span->chans[x - 2]->channo != brite_dchan - 2
+			|| span->chans[x - 1]->channo != brite_dchan - 1)
+			return false;
+		*b1 = span->chans[x - 2];
+		*b2 = span->chans[x - 1];
+		*d = candidate;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Synthesize the network-to-NT M bits after all three BRITE channel chunks
+ * have been prepared.  This is intentionally keyed to one explicit D+
+ * channel, so no other DAHDI span is changed.
+ */
+static void brite_prepare_transmit(struct dahdi_span *span)
+{
+	struct dahdi_chan *b1;
+	struct dahdi_chan *b2;
+	struct dahdi_chan *d;
+	unsigned long flags;
+	unsigned int x;
+
+	if (!brite_channels(span, &b1, &b2, &d))
+		return;
+
+	spin_lock_irqsave(&brite_lock, flags);
+	for (x = 0; x < DAHDI_CHUNKSIZE; ++x) {
+		struct brite_state *state = &brite_state;
+		/*
+		 * writechunk already contains the user's delayed D+ echo and is
+		 * therefore in the same time domain as B1, B2, and the D bits we
+		 * are about to CRC.  readchunk is a later receive interval.
+		 */
+		unsigned int overhead = !!(d->writechunk[x] & BRITE_M_MASK);
+		unsigned int phase;
+
+		++state->sample;
+		brite_record_overhead(state, overhead);
+		if (!state->synced)
+			brite_find_sync(state);
+		if (!state->synced)
+			continue; /* Preserve transparent D+ until the carrier is located. */
+
+		phase = (state->sample - state->marker_sample) % 96;
+		if (!(phase & 1) && (overhead != (phase == 0))) {
+			/* Carrier framing moved or a false M-channel lock was selected. */
+			state->synced = 0;
+			state->collecting = 0;
+			state->crc = 0;
+			state->tx_crc = 0;
+			++brite_tx_sync_losses;
+			continue;
+		}
+		if (!state->collecting && phase == 0) {
+			/* ANSI T1.601 clears the CRC register for each superframe. */
+			state->crc = 0;
+			state->collecting = 1;
+		}
+		if (!state->collecting)
+			continue; /* Wait for a whole superframe before replacing M bits. */
+
+		state->crc = brite_crc12_octet(state->crc, b1->writechunk[x], false);
+		state->crc = brite_crc12_octet(state->crc, b2->writechunk[x], false);
+		brite_crc12_bit(state, !!(d->writechunk[x] & BRITE_D6_MASK));
+		brite_crc12_bit(state, !!(d->writechunk[x] & BRITE_D7_MASK));
+
+		if ((phase % 12) == 11)
+			brite_crc12_bit(state, brite_m4_bit(phase / 12));
+		if (phase & 1) {
+			unsigned int basic_frame = phase / 12;
+			unsigned int m_bit = (phase % 12) / 2;
+
+			if (brite_m_bit(state, basic_frame, m_bit))
+				d->writechunk[x] |= BRITE_M_MASK;
+			else
+				d->writechunk[x] &= ~BRITE_M_MASK;
+		}
+		if (phase == 95) {
+			state->tx_crc = state->crc;
+			state->collecting = 0;
+			++brite_tx_superframes;
+		}
+	}
+	spin_unlock_irqrestore(&brite_lock, flags);
+}
+
+static void brite_rx_record_overhead(struct brite_rx_state *state,
+	unsigned int bit)
+{
+	state->overhead[state->overhead_head++ & (BRITE_HISTORY - 1)] = bit;
+	if (state->overhead_count < BRITE_HISTORY)
+		++state->overhead_count;
+}
+
+static void brite_rx_find_sync(struct brite_rx_state *state)
+{
+	unsigned int lane;
+
+	if (state->overhead_count < 96)
+		return;
+	for (lane = 0; lane != 2; ++lane) {
+		unsigned int marker = 0;
+		unsigned int markers = 0;
+		unsigned int pos;
+
+		for (pos = lane; pos < 96; pos += 2) {
+			unsigned int index = (state->overhead_head - 96 + pos)
+				& (BRITE_HISTORY - 1);
+
+			if (state->overhead[index]) {
+				++markers;
+				marker = pos;
+			}
+		}
+		if (markers == 1) {
+			state->marker_sample = state->sample - 95 + marker;
+			state->synced = 1;
+			state->collecting = 0;
+			state->have_expected = 0;
+			return;
+		}
+	}
+}
+
+/*
+ * The received M CRC is an on-wire oracle for the byte and D-bit order.
+ * It observes only the first BRITE span and never changes its read chunks.
+ */
+static void brite_prepare_receive(struct dahdi_span *span)
+{
+	struct dahdi_chan *b1;
+	struct dahdi_chan *b2;
+	struct dahdi_chan *d;
+	unsigned long flags;
+	unsigned int x;
+
+	if (!brite_channels(span, &b1, &b2, &d))
+		return;
+
+	spin_lock_irqsave(&brite_lock, flags);
+	for (x = 0; x < DAHDI_CHUNKSIZE; ++x) {
+		struct brite_rx_state *state = &brite_rx_state;
+		unsigned int overhead = !!(d->readchunk[x] & BRITE_M_MASK);
+		unsigned int phase;
+		unsigned int d6;
+		unsigned int d7;
+		unsigned int candidate;
+
+		++state->sample;
+		brite_rx_record_overhead(state, overhead);
+		if (!state->synced)
+			brite_rx_find_sync(state);
+		if (!state->synced)
+			continue;
+
+		phase = (state->sample - state->marker_sample) % 96;
+		if (!(phase & 1) && (overhead != (phase == 0))) {
+			state->synced = 0;
+			state->collecting = 0;
+			state->have_expected = 0;
+			continue;
+		}
+		if (!state->collecting && phase == 0) {
+			state->collecting = 1;
+			state->received_crc = 0;
+			for (candidate = 0; candidate < ARRAY_SIZE(state->crc); ++candidate)
+				state->crc[candidate] = 0;
+		}
+		if (!state->collecting)
+			continue;
+
+		if (phase & 1) {
+			unsigned int basic_frame = phase / 12;
+			unsigned int m_bit = (phase % 12) / 2;
+
+			if (m_bit == 3)
+				state->m4 = overhead;
+			if (basic_frame >= 2 && m_bit >= 4)
+				state->received_crc = (state->received_crc << 1) | overhead;
+		}
+
+		d6 = !!(d->readchunk[x] & BRITE_D6_MASK);
+		d7 = !!(d->readchunk[x] & BRITE_D7_MASK);
+		state->crc[0] = brite_crc12_octet(state->crc[0], b1->readchunk[x], false);
+		state->crc[0] = brite_crc12_octet(state->crc[0], b2->readchunk[x], false);
+		state->crc[0] = brite_crc12_update(state->crc[0], d6);
+		state->crc[0] = brite_crc12_update(state->crc[0], d7);
+
+		state->crc[1] = brite_crc12_octet(state->crc[1], b1->readchunk[x], true);
+		state->crc[1] = brite_crc12_octet(state->crc[1], b2->readchunk[x], true);
+		state->crc[1] = brite_crc12_update(state->crc[1], d6);
+		state->crc[1] = brite_crc12_update(state->crc[1], d7);
+
+		state->crc[2] = brite_crc12_octet(state->crc[2], b1->readchunk[x], false);
+		state->crc[2] = brite_crc12_octet(state->crc[2], b2->readchunk[x], false);
+		state->crc[2] = brite_crc12_update(state->crc[2], d7);
+		state->crc[2] = brite_crc12_update(state->crc[2], d6);
+
+		state->crc[3] = brite_crc12_octet(state->crc[3], b1->readchunk[x], true);
+		state->crc[3] = brite_crc12_octet(state->crc[3], b2->readchunk[x], true);
+		state->crc[3] = brite_crc12_update(state->crc[3], d7);
+		state->crc[3] = brite_crc12_update(state->crc[3], d6);
+
+		if ((phase % 12) == 11) {
+			for (candidate = 0; candidate < ARRAY_SIZE(state->crc); ++candidate)
+				state->crc[candidate] = brite_crc12_update(state->crc[candidate],
+					state->m4);
+		}
+		if (phase == 95) {
+			if (state->have_expected) {
+				++brite_rx_crc_checks;
+				brite_rx_crc_msb_dnormal += state->received_crc == state->expected[0];
+				brite_rx_crc_lsb_dnormal += state->received_crc == state->expected[1];
+				brite_rx_crc_msb_dreverse += state->received_crc == state->expected[2];
+				brite_rx_crc_lsb_dreverse += state->received_crc == state->expected[3];
+			}
+			for (candidate = 0; candidate < ARRAY_SIZE(state->crc); ++candidate)
+				state->expected[candidate] = state->crc[candidate];
+			state->have_expected = 1;
+			state->collecting = 0;
+		}
+	}
+	spin_unlock_irqrestore(&brite_lock, flags);
+}
+
 int _dahdi_transmit(struct dahdi_span *span)
 {
 	unsigned int x;
@@ -9843,6 +10230,8 @@ int _dahdi_transmit(struct dahdi_span *span)
 		}
 		spin_unlock(&chan->lock);
 	}
+
+	brite_prepare_transmit(span);
 
 	if (span->mainttimer) {
 		span->mainttimer -= DAHDI_CHUNKSIZE;
@@ -10230,6 +10619,8 @@ int _dahdi_receive(struct dahdi_span *span)
 		spin_unlock(&chan->lock);
 	}
 
+	brite_prepare_receive(span);
+
 	if (dahdi_is_sync_master(span))
 		_process_masterspan();
 
@@ -10256,6 +10647,32 @@ MODULE_PARM_DESC(max_pseudo_channels, "Maximum number of pseudo channels.");
 
 module_param(hwec_overrides_swec, int, 0644);
 MODULE_PARM_DESC(hwec_overrides_swec, "When true, a hardware echo canceller is used instead of configured SWEC.");
+
+module_param(brite_dchan, int, 0644);
+MODULE_PARM_DESC(brite_dchan,
+	"BRITE D+ channel; 0 disables the ANSI T1.601 M-channel adapter");
+
+module_param(brite_tx_superframes, ulong, 0444);
+MODULE_PARM_DESC(brite_tx_superframes,
+	"Number of BRITE transmit superframes with synthesized M bits");
+module_param(brite_tx_sync_losses, ulong, 0444);
+MODULE_PARM_DESC(brite_tx_sync_losses,
+	"Number of BRITE transmit M-channel synchronization losses");
+module_param(brite_rx_crc_checks, ulong, 0444);
+MODULE_PARM_DESC(brite_rx_crc_checks,
+	"Number of complete received BRITE CRC superframes checked");
+module_param(brite_rx_crc_msb_dnormal, ulong, 0444);
+MODULE_PARM_DESC(brite_rx_crc_msb_dnormal,
+	"Received BRITE CRC matches using B MSB-first, D6 then D7");
+module_param(brite_rx_crc_lsb_dnormal, ulong, 0444);
+MODULE_PARM_DESC(brite_rx_crc_lsb_dnormal,
+	"Received BRITE CRC matches using B LSB-first, D6 then D7");
+module_param(brite_rx_crc_msb_dreverse, ulong, 0444);
+MODULE_PARM_DESC(brite_rx_crc_msb_dreverse,
+	"Received BRITE CRC matches using B MSB-first, D7 then D6");
+module_param(brite_rx_crc_lsb_dreverse, ulong, 0444);
+MODULE_PARM_DESC(brite_rx_crc_lsb_dreverse,
+	"Received BRITE CRC matches using B LSB-first, D7 then D6");
 
 module_param(auto_assign_spans, int, 0644);
 MODULE_PARM_DESC(auto_assign_spans,
