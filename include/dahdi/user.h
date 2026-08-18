@@ -690,6 +690,23 @@ struct dahdi_chanconfig {
 #define DAHDI_CHANCONFIG		_IOW(DAHDI_CODE, 19, struct dahdi_chanconfig)
 
 /*
+ * Configure the ANSI T1.601 BRITE transport that occupies two bearer
+ * channels and one D+ channel on a T1 span.  The channels must be members of
+ * the same span and be ordered B1, B2, D+ in adjacent DS0 positions.
+ *
+ * To disable a configured transport, specify its dchan with flags set to 0.
+ */
+struct dahdi_brite_config {
+	int	bchan1;
+	int	bchan2;
+	int	dchan;
+	__u32	flags;
+};
+
+#define DAHDI_BRITE_CONFIG_ENABLE	(1U << 0)
+#define DAHDI_BRITECONFIG		_IOW(DAHDI_CODE, 106, struct dahdi_brite_config)
+
+/*
  * Set Conference to mute mode
  */
 #define DAHDI_CONFMUTE			_IOW(DAHDI_CODE, 20, int)

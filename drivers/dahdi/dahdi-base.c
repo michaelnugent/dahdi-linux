@@ -158,7 +158,9 @@ static int hwec_overrides_swec = 1;
  * DAHDI channels, but carries the U-interface M channel in bit 5 of the D
  * channel.  The M-channel CRC covers all three transmit channels, so it
  * must be made here, after DAHDI has filled every writechunk.  Leaving this
- * disabled is a no-op; brite_dchan identifies the D+ channel when enabled.
+ * disabled is a no-op.  DAHDI_BRITECONFIG selects the B1, B2, and D+ channels.
+ * brite_dchan remains as a temporary backwards-compatible test control until
+ * dahdi_cfg learns the BRITE configuration directive.
  */
 static int brite_dchan;
 
@@ -194,8 +196,18 @@ struct brite_rx_state {
 	unsigned int m4;
 };
 
-static struct brite_state brite_state;
-static struct brite_rx_state brite_rx_state;
+struct brite_transport {
+	int bchan1;
+	int bchan2;
+	int dchan;
+	bool configured;
+	struct brite_state tx;
+	struct brite_rx_state rx;
+};
+
+/* One BRITE transport per DAHDI span, plus one legacy module-parameter slot. */
+static struct brite_transport brite_transports[DAHDI_MAX_SPANS];
+static struct brite_transport brite_legacy_transport;
 static DEFINE_SPINLOCK(brite_lock);
 
 /* Read-only diagnostics for selecting the exact DS0 serialization order. */
@@ -5082,6 +5094,76 @@ static int dahdi_ioctl_chanconfig(struct file *file, unsigned long data)
 }
 
 /**
+ * dahdi_ioctl_briteconfig - Select an ANSI T1.601 BRITE channel triple.
+ *
+ * BRITE M-channel generation works on complete TDM chunks, so configuration
+ * is deliberately a control-device operation rather than a property of any
+ * one individual channel.  dahdi_cfg applies it after channel configuration
+ * and before DAHDI_STARTUP.
+ */
+static int dahdi_ioctl_briteconfig(unsigned long data)
+{
+	struct dahdi_brite_config config;
+	struct dahdi_chan *bchan1;
+	struct dahdi_chan *bchan2;
+	struct dahdi_chan *dchan;
+	struct dahdi_span *span;
+	struct brite_transport *transport;
+	unsigned long flags;
+
+	if (copy_from_user(&config, (void __user *)data, sizeof(config)))
+		return -EFAULT;
+	if (config.flags & ~DAHDI_BRITE_CONFIG_ENABLE)
+		return -EINVAL;
+	if (config.dchan <= 0)
+		return -EINVAL;
+
+	dchan = chan_from_num(config.dchan);
+	if (!dchan || !dchan->span)
+		return -EINVAL;
+	span = dchan->span;
+	if (span->spanno <= 0 || span->spanno > DAHDI_MAX_SPANS)
+		return -EINVAL;
+	if (span->flags & DAHDI_FLAG_RUNNING)
+		return -EBUSY;
+	transport = &brite_transports[span->spanno - 1];
+
+	if (!(config.flags & DAHDI_BRITE_CONFIG_ENABLE)) {
+		spin_lock_irqsave(&brite_lock, flags);
+		if (!transport->configured || transport->dchan != config.dchan) {
+			spin_unlock_irqrestore(&brite_lock, flags);
+			return -ENOENT;
+		}
+		memset(transport, 0, sizeof(*transport));
+		spin_unlock_irqrestore(&brite_lock, flags);
+		return 0;
+	}
+
+	if (config.bchan1 <= 0 || config.bchan2 <= 0
+		|| config.bchan1 == config.bchan2
+		|| config.bchan1 == config.dchan
+		|| config.bchan2 == config.dchan)
+		return -EINVAL;
+	bchan1 = chan_from_num(config.bchan1);
+	bchan2 = chan_from_num(config.bchan2);
+	if (!bchan1 || !bchan2 || bchan1->span != span || bchan2->span != span)
+		return -EINVAL;
+	if (bchan1->chanpos + 1 != bchan2->chanpos
+		|| bchan2->chanpos + 1 != dchan->chanpos)
+		return -EINVAL;
+
+	spin_lock_irqsave(&brite_lock, flags);
+	memset(transport, 0, sizeof(*transport));
+	transport->bchan1 = config.bchan1;
+	transport->bchan2 = config.bchan2;
+	transport->dchan = config.dchan;
+	transport->configured = true;
+	spin_unlock_irqrestore(&brite_lock, flags);
+
+	return 0;
+}
+
+/**
  * dahdi_ioctl_set_dialparms - Set the global dial parameters.
  * @data:	Pointer to user space that contains dahdi_dialparams.
  */
@@ -5618,6 +5700,8 @@ dahdi_ctl_ioctl(struct file *file, unsigned int cmd, unsigned long data)
 		return dahdi_ioctl_attach_echocan(data);
 	case DAHDI_CHANCONFIG:
 		return dahdi_ioctl_chanconfig(file, data);
+	case DAHDI_BRITECONFIG:
+		return dahdi_ioctl_briteconfig(data);
 	case DAHDI_SFCONFIG:
 		return dahdi_ioctl_sfconfig(data);
 	case DAHDI_DEFAULTZONE:
@@ -9949,20 +10033,45 @@ static void brite_find_sync(struct brite_state *state)
 	}
 }
 
-static bool brite_channels(struct dahdi_span *span, struct dahdi_chan **b1,
+static struct brite_transport *brite_transport_for_span(struct dahdi_span *span)
+{
+	struct brite_transport *transport;
+
+	if (span->spanno > 0 && span->spanno <= DAHDI_MAX_SPANS) {
+		transport = &brite_transports[span->spanno - 1];
+		if (transport->configured)
+			return transport;
+	}
+	if (brite_dchan >= 3)
+		return &brite_legacy_transport;
+	return NULL;
+}
+
+static bool brite_channels(struct dahdi_span *span,
+	const struct brite_transport *transport, struct dahdi_chan **b1,
 	struct dahdi_chan **b2, struct dahdi_chan **d)
 {
 	unsigned int x;
+	int bchan1;
+	int bchan2;
+	int dchan;
 
-	if (brite_dchan < 3)
-		return false;
+	if (transport->configured) {
+		bchan1 = transport->bchan1;
+		bchan2 = transport->bchan2;
+		dchan = transport->dchan;
+	} else {
+		bchan1 = brite_dchan - 2;
+		bchan2 = brite_dchan - 1;
+		dchan = brite_dchan;
+	}
 	for (x = 2; x < span->channels; ++x) {
 		struct dahdi_chan *candidate = span->chans[x];
 
-		if (candidate->channo != brite_dchan)
+		if (candidate->channo != dchan)
 			continue;
-		if (span->chans[x - 2]->channo != brite_dchan - 2
-			|| span->chans[x - 1]->channo != brite_dchan - 1)
+		if (span->chans[x - 2]->channo != bchan1
+			|| span->chans[x - 1]->channo != bchan2)
 			return false;
 		*b1 = span->chans[x - 2];
 		*b2 = span->chans[x - 1];
@@ -9982,15 +10091,17 @@ static void brite_prepare_transmit(struct dahdi_span *span)
 	struct dahdi_chan *b1;
 	struct dahdi_chan *b2;
 	struct dahdi_chan *d;
+	struct brite_transport *transport;
+	struct brite_state *state;
 	unsigned long flags;
 	unsigned int x;
 
-	if (!brite_channels(span, &b1, &b2, &d))
-		return;
-
 	spin_lock_irqsave(&brite_lock, flags);
+	transport = brite_transport_for_span(span);
+	if (!transport || !brite_channels(span, transport, &b1, &b2, &d))
+		goto unlock;
+	state = &transport->tx;
 	for (x = 0; x < DAHDI_CHUNKSIZE; ++x) {
-		struct brite_state *state = &brite_state;
 		/*
 		 * writechunk already contains the user's delayed D+ echo and is
 		 * therefore in the same time domain as B1, B2, and the D bits we
@@ -10046,6 +10157,8 @@ static void brite_prepare_transmit(struct dahdi_span *span)
 			++brite_tx_superframes;
 		}
 	}
+
+unlock:
 	spin_unlock_irqrestore(&brite_lock, flags);
 }
 
@@ -10096,15 +10209,17 @@ static void brite_prepare_receive(struct dahdi_span *span)
 	struct dahdi_chan *b1;
 	struct dahdi_chan *b2;
 	struct dahdi_chan *d;
+	struct brite_transport *transport;
+	struct brite_rx_state *state;
 	unsigned long flags;
 	unsigned int x;
 
-	if (!brite_channels(span, &b1, &b2, &d))
-		return;
-
 	spin_lock_irqsave(&brite_lock, flags);
+	transport = brite_transport_for_span(span);
+	if (!transport || !brite_channels(span, transport, &b1, &b2, &d))
+		goto unlock;
+	state = &transport->rx;
 	for (x = 0; x < DAHDI_CHUNKSIZE; ++x) {
-		struct brite_rx_state *state = &brite_rx_state;
 		unsigned int overhead = !!(d->readchunk[x] & BRITE_M_MASK);
 		unsigned int phase;
 		unsigned int d6;
@@ -10185,6 +10300,8 @@ static void brite_prepare_receive(struct dahdi_span *span)
 			state->collecting = 0;
 		}
 	}
+
+unlock:
 	spin_unlock_irqrestore(&brite_lock, flags);
 }
 
@@ -10650,7 +10767,7 @@ MODULE_PARM_DESC(hwec_overrides_swec, "When true, a hardware echo canceller is u
 
 module_param(brite_dchan, int, 0644);
 MODULE_PARM_DESC(brite_dchan,
-	"BRITE D+ channel; 0 disables the ANSI T1.601 M-channel adapter");
+	"Deprecated BRITE D+ channel; use DAHDI_BRITECONFIG instead");
 
 module_param(brite_tx_superframes, ulong, 0444);
 MODULE_PARM_DESC(brite_tx_superframes,
