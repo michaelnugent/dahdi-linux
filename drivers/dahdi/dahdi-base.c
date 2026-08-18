@@ -5124,9 +5124,20 @@ static int dahdi_ioctl_briteconfig(unsigned long data)
 	span = dchan->span;
 	if (span->spanno <= 0 || span->spanno > DAHDI_MAX_SPANS)
 		return -EINVAL;
+	transport = &brite_transports[span->spanno - 1];
+	if (config.flags & DAHDI_BRITE_CONFIG_ENABLE) {
+		spin_lock_irqsave(&brite_lock, flags);
+		if (transport->configured
+			&& transport->bchan1 == config.bchan1
+			&& transport->bchan2 == config.bchan2
+			&& transport->dchan == config.dchan) {
+			spin_unlock_irqrestore(&brite_lock, flags);
+			return 0;
+		}
+		spin_unlock_irqrestore(&brite_lock, flags);
+	}
 	if (span->flags & DAHDI_FLAG_RUNNING)
 		return -EBUSY;
-	transport = &brite_transports[span->spanno - 1];
 
 	if (!(config.flags & DAHDI_BRITE_CONFIG_ENABLE)) {
 		spin_lock_irqsave(&brite_lock, flags);
