@@ -159,10 +159,7 @@ static int hwec_overrides_swec = 1;
  * channel.  The M-channel CRC covers all three transmit channels, so it
  * must be made here, after DAHDI has filled every writechunk.  Leaving this
  * disabled is a no-op.  DAHDI_BRITECONFIG selects the B1, B2, and D+ channels.
- * brite_dchan remains as a temporary backwards-compatible test control until
- * dahdi_cfg learns the BRITE configuration directive.
  */
-static int brite_dchan;
 
 #define BRITE_D6_MASK	0x04	/* Telco bit 6 (first D bit). */
 #define BRITE_D7_MASK	0x02	/* Telco bit 7 (second D bit). */
@@ -181,43 +178,34 @@ struct brite_state {
 	u16 tx_crc;
 };
 
-struct brite_rx_state {
-	unsigned char overhead[BRITE_HISTORY];
-	unsigned int overhead_head;
-	unsigned int overhead_count;
-	unsigned long sample;
-	unsigned long marker_sample;
-	unsigned int synced:1;
-	unsigned int collecting:1;
-	unsigned int have_expected:1;
-	u16 crc[4];
-	u16 expected[4];
-	u16 received_crc;
-	unsigned int m4;
-};
-
 struct brite_transport {
 	int bchan1;
 	int bchan2;
 	int dchan;
 	bool configured;
+	u8 dplus_overhead[DAHDI_CHUNKSIZE];
+	bool dplus_valid;
 	struct brite_state tx;
-	struct brite_rx_state rx;
 };
 
-/* One BRITE transport per DAHDI span, plus one legacy module-parameter slot. */
+/* One BRITE transport per DAHDI span. */
 static struct brite_transport brite_transports[DAHDI_MAX_SPANS];
-static struct brite_transport brite_legacy_transport;
 static DEFINE_SPINLOCK(brite_lock);
 
-/* Read-only diagnostics for selecting the exact DS0 serialization order. */
-static unsigned long brite_tx_superframes;
-static unsigned long brite_tx_sync_losses;
-static unsigned long brite_rx_crc_checks;
-static unsigned long brite_rx_crc_msb_dnormal;
-static unsigned long brite_rx_crc_lsb_dnormal;
-static unsigned long brite_rx_crc_msb_dreverse;
-static unsigned long brite_rx_crc_lsb_dreverse;
+static inline enum fasthdlc_mode dahdi_fasthdlc_mode(const struct dahdi_chan *chan)
+{
+	if (chan->flags & DAHDI_FLAG_BRITE)
+		return FASTHDLC_MODE_16;
+	return (chan->flags & DAHDI_FLAG_HDLC56) ?
+		FASTHDLC_MODE_56 : FASTHDLC_MODE_64;
+}
+
+static inline void dahdi_fasthdlc_init(struct dahdi_chan *chan)
+{
+	fasthdlc_init(&chan->rxhdlc, dahdi_fasthdlc_mode(chan));
+	fasthdlc_init(&chan->txhdlc, dahdi_fasthdlc_mode(chan));
+	chan->infcs = PPP_INITFCS;
+}
 
 /*!
  * \brief states for transmit signalling
@@ -2089,9 +2077,7 @@ static int dahdi_net_open(struct net_device *dev)
 	if (res)
 		return res;
 
-	fasthdlc_init(&ms->rxhdlc, (ms->flags & DAHDI_FLAG_HDLC56) ? FASTHDLC_MODE_56 : FASTHDLC_MODE_64);
-	fasthdlc_init(&ms->txhdlc, (ms->flags & DAHDI_FLAG_HDLC56) ? FASTHDLC_MODE_56 : FASTHDLC_MODE_64);
-	ms->infcs = PPP_INITFCS;
+	dahdi_fasthdlc_init(ms);
 
 	netif_start_queue(chan_to_netdev(ms));
 
@@ -3037,9 +3023,7 @@ static int initialize_channel(struct dahdi_chan *chan)
 	chan->firstcadencepos = 0; /* By default loop back to first cadence position */
 
 	/* HDLC & FCS stuff */
-	fasthdlc_init(&chan->rxhdlc, (chan->flags & DAHDI_FLAG_HDLC56) ? FASTHDLC_MODE_56 : FASTHDLC_MODE_64);
-	fasthdlc_init(&chan->txhdlc, (chan->flags & DAHDI_FLAG_HDLC56) ? FASTHDLC_MODE_56 : FASTHDLC_MODE_64);
-	chan->infcs = PPP_INITFCS;
+	dahdi_fasthdlc_init(chan);
 
 	/* Timings for RBS */
 	chan->prewinktime = DAHDI_DEFAULT_PREWINKTIME;
@@ -5099,8 +5083,49 @@ static int dahdi_ioctl_chanconfig(struct file *file, unsigned long data)
  * BRITE M-channel generation works on complete TDM chunks, so configuration
  * is deliberately a control-device operation rather than a property of any
  * one individual channel.  dahdi_cfg applies it after channel configuration
- * and before DAHDI_STARTUP.
+ * and before DAHDI_STARTUP.  The D+ channel must be configured as FCS HDLC;
+ * this ioctl changes its HDLC serializer to the BRITE 16 kbit/s lane.
  */
+static void brite_set_dchan_mode(struct dahdi_chan *dchan, bool enable)
+{
+	unsigned long flags;
+
+	if (!dchan)
+		return;
+	spin_lock_irqsave(&dchan->lock, flags);
+	if (enable)
+		dchan->flags |= DAHDI_FLAG_BRITE;
+	else
+		dchan->flags &= ~DAHDI_FLAG_BRITE;
+	dahdi_fasthdlc_init(dchan);
+	spin_unlock_irqrestore(&dchan->lock, flags);
+}
+
+static void brite_shutdown_span(struct dahdi_span *span)
+{
+	struct brite_transport *transport;
+	struct dahdi_chan *dchan;
+	unsigned long flags;
+	int dchan_num;
+
+	if (span->spanno <= 0 || span->spanno > DAHDI_MAX_SPANS)
+		return;
+
+	transport = &brite_transports[span->spanno - 1];
+	spin_lock_irqsave(&brite_lock, flags);
+	if (!transport->configured) {
+		spin_unlock_irqrestore(&brite_lock, flags);
+		return;
+	}
+	dchan_num = transport->dchan;
+	memset(transport, 0, sizeof(*transport));
+	spin_unlock_irqrestore(&brite_lock, flags);
+
+	dchan = chan_from_num(dchan_num);
+	if (dchan)
+		brite_set_dchan_mode(dchan, false);
+}
+
 static int dahdi_ioctl_briteconfig(unsigned long data)
 {
 	struct dahdi_brite_config config;
@@ -5110,6 +5135,7 @@ static int dahdi_ioctl_briteconfig(unsigned long data)
 	struct dahdi_span *span;
 	struct brite_transport *transport;
 	unsigned long flags;
+	int old_dchan = 0;
 
 	if (copy_from_user(&config, (void __user *)data, sizeof(config)))
 		return -EFAULT;
@@ -5147,6 +5173,7 @@ static int dahdi_ioctl_briteconfig(unsigned long data)
 		}
 		memset(transport, 0, sizeof(*transport));
 		spin_unlock_irqrestore(&brite_lock, flags);
+		brite_set_dchan_mode(dchan, false);
 		return 0;
 	}
 
@@ -5162,9 +5189,21 @@ static int dahdi_ioctl_briteconfig(unsigned long data)
 	if (bchan1->chanpos + 1 != bchan2->chanpos
 		|| bchan2->chanpos + 1 != dchan->chanpos)
 		return -EINVAL;
+	if (bchan1->sig != DAHDI_SIG_CLEAR || bchan2->sig != DAHDI_SIG_CLEAR
+		|| dchan->sig != DAHDI_SIG_HDLCFCS)
+		return -EINVAL;
 
 	spin_lock_irqsave(&brite_lock, flags);
+	if (transport->configured)
+		old_dchan = transport->dchan;
 	memset(transport, 0, sizeof(*transport));
+	spin_unlock_irqrestore(&brite_lock, flags);
+
+	if (old_dchan)
+		brite_set_dchan_mode(chan_from_num(old_dchan), false);
+	brite_set_dchan_mode(dchan, true);
+
+	spin_lock_irqsave(&brite_lock, flags);
 	transport->bchan1 = config.bchan1;
 	transport->bchan2 = config.bchan2;
 	transport->dchan = config.dchan;
@@ -5364,6 +5403,8 @@ static int dahdi_shutdown_span(struct dahdi_span *s)
 {
 	int res = 0;
 	int x;
+
+	brite_shutdown_span(s);
 
 	/* Unconfigure channels */
 	for (x = 0; x < s->channels; x++)
@@ -6851,8 +6892,7 @@ static int dahdi_chan_ioctl(struct file *file, unsigned int cmd, unsigned long d
 		chan->flags &= ~(DAHDI_FLAG_AUDIO | DAHDI_FLAG_HDLC | DAHDI_FLAG_FCS);
 		if (j) {
 			chan->flags |= DAHDI_FLAG_HDLC;
-			fasthdlc_init(&chan->rxhdlc, (chan->flags & DAHDI_FLAG_HDLC56) ? FASTHDLC_MODE_56 : FASTHDLC_MODE_64);
-			fasthdlc_init(&chan->txhdlc, (chan->flags & DAHDI_FLAG_HDLC56) ? FASTHDLC_MODE_56 : FASTHDLC_MODE_64);
+			dahdi_fasthdlc_init(chan);
 		}
 		break;
 	case DAHDI_HDLCFCSMODE:
@@ -6861,8 +6901,7 @@ static int dahdi_chan_ioctl(struct file *file, unsigned int cmd, unsigned long d
 		chan->flags &= ~(DAHDI_FLAG_AUDIO | DAHDI_FLAG_HDLC | DAHDI_FLAG_FCS);
 		if (j) {
 			chan->flags |= DAHDI_FLAG_HDLC | DAHDI_FLAG_FCS;
-			fasthdlc_init(&chan->rxhdlc, (chan->flags & DAHDI_FLAG_HDLC56) ? FASTHDLC_MODE_56 : FASTHDLC_MODE_64);
-			fasthdlc_init(&chan->txhdlc, (chan->flags & DAHDI_FLAG_HDLC56) ? FASTHDLC_MODE_56 : FASTHDLC_MODE_64);
+			dahdi_fasthdlc_init(chan);
 		}
 		break;
 	case DAHDI_HDLC_RATE:
@@ -6873,8 +6912,7 @@ static int dahdi_chan_ioctl(struct file *file, unsigned int cmd, unsigned long d
 			chan->flags &= ~DAHDI_FLAG_HDLC56;
 		}
 
-		fasthdlc_init(&chan->rxhdlc, (chan->flags & DAHDI_FLAG_HDLC56) ? FASTHDLC_MODE_56 : FASTHDLC_MODE_64);
-		fasthdlc_init(&chan->txhdlc, (chan->flags & DAHDI_FLAG_HDLC56) ? FASTHDLC_MODE_56 : FASTHDLC_MODE_64);
+		dahdi_fasthdlc_init(chan);
 		break;
 	case DAHDI_ECHOCANCEL_PARAMS:
 	{
@@ -10046,16 +10084,11 @@ static void brite_find_sync(struct brite_state *state)
 
 static struct brite_transport *brite_transport_for_span(struct dahdi_span *span)
 {
-	struct brite_transport *transport;
-
-	if (span->spanno > 0 && span->spanno <= DAHDI_MAX_SPANS) {
-		transport = &brite_transports[span->spanno - 1];
-		if (transport->configured)
-			return transport;
-	}
-	if (brite_dchan >= 3)
-		return &brite_legacy_transport;
-	return NULL;
+	if (span->spanno <= 0 || span->spanno > DAHDI_MAX_SPANS)
+		return NULL;
+	if (!brite_transports[span->spanno - 1].configured)
+		return NULL;
+	return &brite_transports[span->spanno - 1];
 }
 
 static bool brite_channels(struct dahdi_span *span,
@@ -10067,15 +10100,9 @@ static bool brite_channels(struct dahdi_span *span,
 	int bchan2;
 	int dchan;
 
-	if (transport->configured) {
-		bchan1 = transport->bchan1;
-		bchan2 = transport->bchan2;
-		dchan = transport->dchan;
-	} else {
-		bchan1 = brite_dchan - 2;
-		bchan2 = brite_dchan - 1;
-		dchan = brite_dchan;
-	}
+	bchan1 = transport->bchan1;
+	bchan2 = transport->bchan2;
+	dchan = transport->dchan;
 	for (x = 2; x < span->channels; ++x) {
 		struct dahdi_chan *candidate = span->chans[x];
 
@@ -10114,12 +10141,22 @@ static void brite_prepare_transmit(struct dahdi_span *span)
 	state = &transport->tx;
 	for (x = 0; x < DAHDI_CHUNKSIZE; ++x) {
 		/*
-		 * writechunk already contains the user's delayed D+ echo and is
-		 * therefore in the same time domain as B1, B2, and the D bits we
-		 * are about to CRC.  readchunk is a later receive interval.
+		 * The normal HDLC core places two serialized D bits in bits 7 and
+		 * 6.  Reinsert them in telco positions 6 and 7 while preserving the
+		 * BRITE carrier and maintenance bits captured from this timeslot.
 		 */
-		unsigned int overhead = !!(d->writechunk[x] & BRITE_M_MASK);
+		unsigned int hdlc = d->writechunk[x];
+		unsigned int dplus = transport->dplus_valid ?
+			transport->dplus_overhead[x] : 0;
+		unsigned int overhead;
 		unsigned int phase;
+
+		if (hdlc & 0x80)
+			dplus |= BRITE_D6_MASK;
+		if (hdlc & 0x40)
+			dplus |= BRITE_D7_MASK;
+		d->writechunk[x] = dplus;
+		overhead = !!(dplus & BRITE_M_MASK);
 
 		++state->sample;
 		brite_record_overhead(state, overhead);
@@ -10135,7 +10172,6 @@ static void brite_prepare_transmit(struct dahdi_span *span)
 			state->collecting = 0;
 			state->crc = 0;
 			state->tx_crc = 0;
-			++brite_tx_sync_losses;
 			continue;
 		}
 		if (!state->collecting && phase == 0) {
@@ -10165,7 +10201,6 @@ static void brite_prepare_transmit(struct dahdi_span *span)
 		if (phase == 95) {
 			state->tx_crc = state->crc;
 			state->collecting = 0;
-			++brite_tx_superframes;
 		}
 	}
 
@@ -10173,55 +10208,13 @@ unlock:
 	spin_unlock_irqrestore(&brite_lock, flags);
 }
 
-static void brite_rx_record_overhead(struct brite_rx_state *state,
-	unsigned int bit)
-{
-	state->overhead[state->overhead_head++ & (BRITE_HISTORY - 1)] = bit;
-	if (state->overhead_count < BRITE_HISTORY)
-		++state->overhead_count;
-}
-
-static void brite_rx_find_sync(struct brite_rx_state *state)
-{
-	unsigned int lane;
-
-	if (state->overhead_count < 96)
-		return;
-	for (lane = 0; lane != 2; ++lane) {
-		unsigned int marker = 0;
-		unsigned int markers = 0;
-		unsigned int pos;
-
-		for (pos = lane; pos < 96; pos += 2) {
-			unsigned int index = (state->overhead_head - 96 + pos)
-				& (BRITE_HISTORY - 1);
-
-			if (state->overhead[index]) {
-				++markers;
-				marker = pos;
-			}
-		}
-		if (markers == 1) {
-			state->marker_sample = state->sample - 95 + marker;
-			state->synced = 1;
-			state->collecting = 0;
-			state->have_expected = 0;
-			return;
-		}
-	}
-}
-
-/*
- * The received M CRC is an on-wire oracle for the byte and D-bit order.
- * It observes only the first BRITE span and never changes its read chunks.
- */
+/* Preserve BRITE overhead and present its D bits to the standard HDLC core. */
 static void brite_prepare_receive(struct dahdi_span *span)
 {
 	struct dahdi_chan *b1;
 	struct dahdi_chan *b2;
 	struct dahdi_chan *d;
 	struct brite_transport *transport;
-	struct brite_rx_state *state;
 	unsigned long flags;
 	unsigned int x;
 
@@ -10229,87 +10222,15 @@ static void brite_prepare_receive(struct dahdi_span *span)
 	transport = brite_transport_for_span(span);
 	if (!transport || !brite_channels(span, transport, &b1, &b2, &d))
 		goto unlock;
-	state = &transport->rx;
 	for (x = 0; x < DAHDI_CHUNKSIZE; ++x) {
-		unsigned int overhead = !!(d->readchunk[x] & BRITE_M_MASK);
-		unsigned int phase;
-		unsigned int d6;
-		unsigned int d7;
-		unsigned int candidate;
+		u8 dplus = d->readchunk[x];
+		unsigned int d6 = !!(dplus & BRITE_D6_MASK);
+		unsigned int d7 = !!(dplus & BRITE_D7_MASK);
 
-		++state->sample;
-		brite_rx_record_overhead(state, overhead);
-		if (!state->synced)
-			brite_rx_find_sync(state);
-		if (!state->synced)
-			continue;
-
-		phase = (state->sample - state->marker_sample) % 96;
-		if (!(phase & 1) && (overhead != (phase == 0))) {
-			state->synced = 0;
-			state->collecting = 0;
-			state->have_expected = 0;
-			continue;
-		}
-		if (!state->collecting && phase == 0) {
-			state->collecting = 1;
-			state->received_crc = 0;
-			for (candidate = 0; candidate < ARRAY_SIZE(state->crc); ++candidate)
-				state->crc[candidate] = 0;
-		}
-		if (!state->collecting)
-			continue;
-
-		if (phase & 1) {
-			unsigned int basic_frame = phase / 12;
-			unsigned int m_bit = (phase % 12) / 2;
-
-			if (m_bit == 3)
-				state->m4 = overhead;
-			if (basic_frame >= 2 && m_bit >= 4)
-				state->received_crc = (state->received_crc << 1) | overhead;
-		}
-
-		d6 = !!(d->readchunk[x] & BRITE_D6_MASK);
-		d7 = !!(d->readchunk[x] & BRITE_D7_MASK);
-		state->crc[0] = brite_crc12_octet(state->crc[0], b1->readchunk[x], false);
-		state->crc[0] = brite_crc12_octet(state->crc[0], b2->readchunk[x], false);
-		state->crc[0] = brite_crc12_update(state->crc[0], d6);
-		state->crc[0] = brite_crc12_update(state->crc[0], d7);
-
-		state->crc[1] = brite_crc12_octet(state->crc[1], b1->readchunk[x], true);
-		state->crc[1] = brite_crc12_octet(state->crc[1], b2->readchunk[x], true);
-		state->crc[1] = brite_crc12_update(state->crc[1], d6);
-		state->crc[1] = brite_crc12_update(state->crc[1], d7);
-
-		state->crc[2] = brite_crc12_octet(state->crc[2], b1->readchunk[x], false);
-		state->crc[2] = brite_crc12_octet(state->crc[2], b2->readchunk[x], false);
-		state->crc[2] = brite_crc12_update(state->crc[2], d7);
-		state->crc[2] = brite_crc12_update(state->crc[2], d6);
-
-		state->crc[3] = brite_crc12_octet(state->crc[3], b1->readchunk[x], true);
-		state->crc[3] = brite_crc12_octet(state->crc[3], b2->readchunk[x], true);
-		state->crc[3] = brite_crc12_update(state->crc[3], d7);
-		state->crc[3] = brite_crc12_update(state->crc[3], d6);
-
-		if ((phase % 12) == 11) {
-			for (candidate = 0; candidate < ARRAY_SIZE(state->crc); ++candidate)
-				state->crc[candidate] = brite_crc12_update(state->crc[candidate],
-					state->m4);
-		}
-		if (phase == 95) {
-			if (state->have_expected) {
-				++brite_rx_crc_checks;
-				brite_rx_crc_msb_dnormal += state->received_crc == state->expected[0];
-				brite_rx_crc_lsb_dnormal += state->received_crc == state->expected[1];
-				brite_rx_crc_msb_dreverse += state->received_crc == state->expected[2];
-				brite_rx_crc_lsb_dreverse += state->received_crc == state->expected[3];
-			}
-			for (candidate = 0; candidate < ARRAY_SIZE(state->crc); ++candidate)
-				state->expected[candidate] = state->crc[candidate];
-			state->have_expected = 1;
-			state->collecting = 0;
-		}
+		transport->dplus_overhead[x] = dplus &
+			~(BRITE_D6_MASK | BRITE_D7_MASK);
+		transport->dplus_valid = true;
+		d->readchunk[x] = (d6 << 7) | (d7 << 6);
 	}
 
 unlock:
@@ -10687,6 +10608,8 @@ int _dahdi_receive(struct dahdi_span *span)
 #ifdef CONFIG_DAHDI_WATCHDOG
 	span->watchcounter--;
 #endif
+	/* Convert the BRITE D+ lane before the ordinary HDLC receive path. */
+	brite_prepare_receive(span);
 	for (x = 0; x < span->channels; x++) {
 		struct dahdi_chan *const chan = span->chans[x];
 		spin_lock(&chan->lock);
@@ -10747,8 +10670,6 @@ int _dahdi_receive(struct dahdi_span *span)
 		spin_unlock(&chan->lock);
 	}
 
-	brite_prepare_receive(span);
-
 	if (dahdi_is_sync_master(span))
 		_process_masterspan();
 
@@ -10775,32 +10696,6 @@ MODULE_PARM_DESC(max_pseudo_channels, "Maximum number of pseudo channels.");
 
 module_param(hwec_overrides_swec, int, 0644);
 MODULE_PARM_DESC(hwec_overrides_swec, "When true, a hardware echo canceller is used instead of configured SWEC.");
-
-module_param(brite_dchan, int, 0644);
-MODULE_PARM_DESC(brite_dchan,
-	"Deprecated BRITE D+ channel; use DAHDI_BRITECONFIG instead");
-
-module_param(brite_tx_superframes, ulong, 0444);
-MODULE_PARM_DESC(brite_tx_superframes,
-	"Number of BRITE transmit superframes with synthesized M bits");
-module_param(brite_tx_sync_losses, ulong, 0444);
-MODULE_PARM_DESC(brite_tx_sync_losses,
-	"Number of BRITE transmit M-channel synchronization losses");
-module_param(brite_rx_crc_checks, ulong, 0444);
-MODULE_PARM_DESC(brite_rx_crc_checks,
-	"Number of complete received BRITE CRC superframes checked");
-module_param(brite_rx_crc_msb_dnormal, ulong, 0444);
-MODULE_PARM_DESC(brite_rx_crc_msb_dnormal,
-	"Received BRITE CRC matches using B MSB-first, D6 then D7");
-module_param(brite_rx_crc_lsb_dnormal, ulong, 0444);
-MODULE_PARM_DESC(brite_rx_crc_lsb_dnormal,
-	"Received BRITE CRC matches using B LSB-first, D6 then D7");
-module_param(brite_rx_crc_msb_dreverse, ulong, 0444);
-MODULE_PARM_DESC(brite_rx_crc_msb_dreverse,
-	"Received BRITE CRC matches using B MSB-first, D7 then D6");
-module_param(brite_rx_crc_lsb_dreverse, ulong, 0444);
-MODULE_PARM_DESC(brite_rx_crc_lsb_dreverse,
-	"Received BRITE CRC matches using B LSB-first, D7 then D6");
 
 module_param(auto_assign_spans, int, 0644);
 MODULE_PARM_DESC(auto_assign_spans,

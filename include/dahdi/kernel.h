@@ -750,6 +750,7 @@ enum {
 	DAHDI_FLAGBIT_BUFEVENTS	= 21,	/*!< Report buffer events */
 	DAHDI_FLAGBIT_TXUNDERRUN = 22,	/*!< Transmit underrun condition */
 	DAHDI_FLAGBIT_RXOVERRUN = 23,	/*!< Receive overrun condition */
+	DAHDI_FLAGBIT_BRITE	= 24,	/*!< 16 kbit/s BRITE D+ transport */
 	DAHDI_FLAGBIT_DEVFILE	= 25,	/*!< Channel has a sysfs dev file */
 };
 
@@ -818,6 +819,7 @@ struct dahdi_count {
 #define DAHDI_FLAG_BUFEVENTS	DAHDI_FLAG(BUFEVENTS)
 #define DAHDI_FLAG_TXUNDERRUN	DAHDI_FLAG(TXUNDERRUN)
 #define DAHDI_FLAG_RXOVERRUN	DAHDI_FLAG(RXOVERRUN)
+#define DAHDI_FLAG_BRITE	DAHDI_FLAG(BRITE)
 
 enum spantypes {
 	SPANTYPE_INVALID	= 0,
